@@ -1,4 +1,5 @@
 import os
+import argparse
 import networkx as nx
 import calendar
 import json
@@ -8,8 +9,8 @@ from urlparse import urlparse
 from tqdm import *
 import subprocess
 from IPy import IP
-
 import pyprind
+import cPickle as pickle
 
 '''
 This module builds a graph from download metadata with fields as defined below
@@ -524,3 +525,238 @@ def build_graph_by_igraph(raw_data, loc, gml_filename):
                 G['event2nodes'][event] = [v.index]
 
     return G
+
+
+def get_raw_downloads(in_file):
+    """ Gets raw download statistics for each node (file, URL, IP) """
+    raw_downloads = {}
+    with open(in_file, 'r') as f:
+        for line in tqdm(f):
+            line = line.rstrip()
+            values = line.split('\t')
+            if len(values) > 15:
+                # Downloaded SHA2
+                try:
+                    raw_downloads[values[4]]['dropped'] += 1
+                except:
+                    try:
+                        raw_downloads[values[4]]['dropped'] = 1
+                    except:
+                        raw_downloads[values[4]] = {'dropped': 1}
+
+                # Parent SHA2
+                try:
+                    raw_downloads[values[9]]['dropper'] += 1
+                except:
+                    try:
+                        raw_downloads[values[9]]['dropper'] = 1
+                    except:
+                        raw_downloads[values[9]] = {'dropper': 1}
+
+                if values[14] != 'NULL':
+                    # Referrer URL
+                    try:
+                        raw_downloads[values[14]]['dropper'] += 1
+                    except:
+                        try:
+                            raw_downloads[values[14]]['dropper'] = 1
+                        except:
+                            raw_downloads[values[14]] = {'dropper': 1}
+                elif values[14] == 'NULL' and values[8] != 'NULL':
+                    # Host URL
+                    try:
+                        raw_downloads[values[8]]['dropper'] += 1
+                    except:
+                        try:
+                            raw_downloads[values[8]]['dropper'] = 1
+                        except:
+                            raw_downloads[values[8]] = {'dropper': 1}
+                elif values[14] == 'NULL' and values[8] == 'NULL' and values[11] != 'NULL':
+                    # Download IP
+                    try:
+                        raw_downloads[values[11]]['dropper'] += 1
+                    except:
+                        try:
+                            raw_downloads[values[11]]['dropper'] = 1
+                        except:
+                            raw_downloads[values[11]] = {'dropper': 1}
+
+                if values[10] != 'NULL':
+                    # Parent SHA2 Host URL
+                    try:
+                        raw_downloads[values[10]]['dropper'] += 1
+                    except:
+                        try:
+                            raw_downloads[values[10]]['dropper'] = 1
+                        except:
+                            raw_downloads[values[10]] = {'dropper': 1}
+    return raw_downloads
+
+
+def enrich_G_raw_downloads(G, raw_downloads):
+    for _v in tqdm(G.vs):
+        try:
+            G.vs[_v.index]['dropped'] = raw_downloads[_v['name']]['dropped']
+        except KeyError:
+            G.vs[_v.index]['dropped'] = 0.0
+        try:
+            G.vs[_v.index]['dropper'] = raw_downloads[_v['name']]['dropper']
+        except KeyError:
+            G.vs[_v.index]['dropper'] = 0.0
+    return G
+
+
+def parse_avclass_data(in_file):
+    avclass_response = {}
+    with open(in_file) as f:
+        for line in f:
+            try:
+                response = line.replace('\n', '').split('\t')
+            except:
+                continue
+            avclass_response[response[0]] = {'label': response[1], 'is_pup': response[2]}
+    return avclass_response
+
+
+def enrich_G_avclass_data(G, avclass_response):
+    for _v in tqdm(G.vs):
+        sha2 = G.vs[_v.index]['name'].lower()
+        try:
+            G.vs[_v.index]['avclasslabel'] = avclass_response[sha2]['label']
+            G.vs[_v.index]['avclassispup'] = avclass_response[sha2]['is_pup']
+        except:
+            G.vs[_v.index]['avclasslabel'] = None
+            G.vs[_v.index]['avclassispup'] = None
+    return G
+
+
+def generate_gml_graph(args):
+    current_directory = os.getcwd()
+
+    in_file_path = os.path.join(current_directory, args.in_file)
+    out_file_dir = os.path.join(current_directory, args.out_dir)
+
+    # Pre-process Data
+    print("Pre-processing data...")
+    droppers = qualified_dropper(in_file_path)
+    filtered_file_path = os.path.join(out_file_dir, "filtered_logs.tsv")
+    filter_rawdata(in_file_path, filtered_file_path, droppers)
+
+    # Build Graph
+    print("Building graph...")
+    G = build(filtered_file_path)
+
+    gml_file_path = os.path.join(out_file_dir, "graph.gml")
+    nx.write_gml(G, gml_file_path)
+    G = Graph.Read_GML(gml_file_path)
+
+    # Filter aberrant nodes
+    print("Filtering aberrant nodes...")
+    parents_no_indegree = [x.index for x in G.vs if x['data'] == 'parent' and G.degree(x.index, mode=2) == 0]
+    G.delete_vertices(parents_no_indegree)
+
+    isolated_nodes = G.vs.select(_degree=0)
+    G.delete_vertices(isolated_nodes)
+
+    # Enrich graph nodes with raw download statistics
+    print("Enriching graph nodes with download statistics...")
+    raw_downloads = get_raw_downloads(filtered_file_path)
+    G = enrich_G_raw_downloads(G, raw_downloads)
+
+    # Enrich graph nodes with AVClass ground truth data
+    # Compatible with AVClass v1: https://github.com/malicialab/avclass/tree/master/avclass
+    if args.in_avclass_file:
+        print("Enriching graph nodes with AVClass data...")
+        in_avclass_filepath = os.path.join(current_directory, args.in_avclass_file)
+        avclass_response = parse_avclass_data(in_avclass_filepath)
+        G = enrich_G_avclass_data(G, avclass_response)
+
+    G.write_gml(gml_file_path)
+    print("Graph generated!")
+
+    return G
+
+
+def generate_components(args, G):
+    current_directory = os.getcwd()
+    out_file_dir = os.path.join(current_directory, args.out_dir)
+
+    components_dict = {}
+
+    print("Generating connected components data...")
+
+    bodydouble = G.copy()
+    weak_components = bodydouble.components(mode=WEAK)
+    ordered_components_indices = [i[0] for i in
+                                  sorted(enumerate(weak_components), key=lambda x: len(x[1]), reverse=True)]
+
+    for i in tqdm(range(len(ordered_components_indices))):
+        j = ordered_components_indices[i]
+        # Test component
+        original_G_tc = weak_components.subgraph(j)
+        G_tc = weak_components.subgraph(j)
+        _tc_original_size = G_tc.vcount()
+        _tc_size_trace = [_tc_original_size]
+        _tc_iter_deg_removals = []
+        count_deg = 0
+        has_articulation_pt = 1
+
+        while _tc_size_trace[-1] > 2 and has_articulation_pt == 1:
+            G_tc_articulation_points = G_tc.articulation_points()
+            temp = G_tc_articulation_points
+            G_tc_articulation_points = {}
+            for node_index in temp:
+                G_tc_articulation_points[node_index] = G_tc.degree(node_index)
+            sorted_art_degree = sorted([(x[1], x[0], G_tc.vs[x[0]]['name']) \
+                                        for x in G_tc_articulation_points.items()], key=lambda x: x[0], reverse=True)
+
+            # Remove next node
+            try:
+                remove_node = sorted_art_degree[0][1]
+            except:
+                break
+            remove_node_id = G_tc.vs[sorted_art_degree[0][1]]['id']
+            _tc_iter_deg_removals.append(remove_node_id)
+            G_tc.delete_vertices(remove_node)
+            G_tc_sub_components = G_tc.components(mode=WEAK)
+            G_tc = G_tc_sub_components.giant()
+            _tc_current_size = G_tc.vcount()
+            _tc_size_trace.append(_tc_current_size)
+            count_deg += 1
+
+        _tc_iter_deg_trace = _tc_size_trace
+
+        components_dict[i] = {
+            # Trace of component size reduction
+            'size_trace': _tc_size_trace,
+            # IDs of removed nodes (time ordered)
+            'removed_nodes': _tc_iter_deg_removals,
+            # Final size of component
+            'min_size': _tc_size_trace[-1],
+            # Component subgraph
+            'subgraph': original_G_tc
+        }
+
+    pickle.dump(components_dict, open(os.path.join(out_file_dir, 'components_dict.pickle'), 'wb'))
+    print("Connected components data generated!")
+
+
+def main():
+    # Parse args
+    parser = argparse.ArgumentParser(description="Build an iGraph graph from a TSV log file. NOTE: Working directory should be parent directory of \"build_graph\".")
+
+    parser.add_argument("--in-file", type=str, help="input TSV filepath")
+    parser.add_argument("--in-avclass-file", type=str, help="input AVClass labels filepath - `label` and `is_pup` data (AVClass v1) expected")
+    parser.add_argument("--out-dir", type=str, help="output file directory (multiple files will be generated)")
+    parser.add_argument("--build-components", action="store_true", help="if flag is set, will build connected components data")
+
+    args = parser.parse_args()
+
+    G = generate_gml_graph(args=args)
+
+    if args.build_components:
+        generate_components(args=args, G=G)
+
+
+if __name__ == "__main__":
+    main()
