@@ -761,7 +761,7 @@ def main():
     parser.add_argument("--in-file", type=str, help="input TSV filepath")
     parser.add_argument("--in-avclass-file", type=str, help="input AVClass labels filepath - `label` and `is_pup` data (AVClass v1) expected")
     parser.add_argument("--out-dir", type=str, help="output file directory (multiple files will be generated)")
-    parser.add_argument("--build-components", action="store_true", help="if flag is set, will build connected components data")
+    parser.add_argument("--build-components", action="store_true", help="if flag is set, will also build connected components data")
 
     args = parser.parse_args()
 
